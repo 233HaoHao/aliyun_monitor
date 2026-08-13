@@ -2,6 +2,7 @@
 import json
 import sys
 import logging
+import re
 import os
 import signal
 import time
@@ -59,10 +60,39 @@ MAX_START_FAILURES = 3
 RESOURCE_RETRY_COOLDOWN = 1800
 # 连续巡检失败达到此次数后，发送"监控失明"告警提醒人工介入
 CHECK_FAILURE_ALERT_THRESHOLD = 3
+# aliyunsdkcore 将 request timeout 参数解释为秒，不是毫秒
+# CDT 请求只对瞬态网络错误做少量重试，确保总耗时远低于单实例 watchdog
+CDT_RETRY_ATTEMPTS = 3
+CDT_RETRY_DELAY = 1
 
 
 class MonitorTimeout(BaseException):
     """单实例巡检超时，必须穿透业务层的 broad except，交由外层 watchdog 处理。"""
+
+
+_SENSITIVE_QUERY_VALUE_RE = re.compile(
+    r"(?P<prefix>(?<![A-Za-z0-9_])['\"]?"
+    r"(?:accesskeyid|accesskeysecret|access_key_id|access_key_secret|"
+    r"signature|signature_nonce|signaturenonce|signaturemethod|signature_method|"
+    r"signatureversion|signature_version|securitytoken|security_token|"
+    r"security-token|sessiontoken|session_token|ststoken|sts_token|"
+    r"x-acs-security-token|authorization|credential|token)"
+    r"['\"]?\s*[=:]\s*['\"]?)"
+    r"(?P<value>[^&\s,;\"'<>()[\]{}]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_sensitive_values(text):
+    """只隐藏签名查询参数值，保留异常中的主机名和原因，便于排障。"""
+    return _SENSITIVE_QUERY_VALUE_RE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        str(text),
+    )
+
+
+def safe_error_text(error):
+    return redact_sensitive_values(str(error))
 
 # 初始化日志
 logger = logging.getLogger(__name__)
@@ -97,7 +127,7 @@ def save_state(state):
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"保存状态文件失败: {e}")
+        logger.error(f"保存状态文件失败: {safe_error_text(e)}")
 
 def can_notify(state, instance_id, event_key, cooldown=None):
     """判断某事件是否已过冷却期，可以再次发送通知"""
@@ -133,7 +163,8 @@ def send_tg_alert(tg_conf, title, message, color_status):
         return False
     icon = "\u2705" if color_status == "green" else "\U0001f6a8"
     url = f"https://api.telegram.org/bot{tg_conf['bot_token']}/sendMessage"
-    text = f"{icon} *[{title}]*\n\n{message}"
+    text = (f"{icon} *[{redact_sensitive_values(title)}]*\n\n"
+            f"{redact_sensitive_values(message)}")
     payloads = [
         {"chat_id": tg_conf['chat_id'], "text": text, "parse_mode": "Markdown"},
         # Markdown 解析失败或网络抖动时，退化为纯文本再试一次，保证告警必达
@@ -144,9 +175,10 @@ def send_tg_alert(tg_conf, title, message, color_status):
             resp = requests.post(url, json=data, timeout=10)
             if resp.status_code == 200:
                 return True
-            logger.error(f"TG发送失败: HTTP {resp.status_code}, {resp.text}")
+            logger.error(f"TG发送失败: HTTP {resp.status_code}, "
+                         f"{redact_sensitive_values(resp.text)}")
         except Exception as e:
-            logger.error(f"TG发送失败: {e}")
+            logger.error(f"TG发送失败: {safe_error_text(e)}")
     return False
 
 def get_balance_line(user):
@@ -164,8 +196,8 @@ def get_balance_line(user):
             req.set_action_name('QueryAccountBalance')
             req.set_method('POST')
             req.set_protocol_type('https')
-            req.set_connect_timeout(5000)
-            req.set_read_timeout(15000)
+            req.set_connect_timeout(5)
+            req.set_read_timeout(15)
             data = json.loads(client.do_action_with_exception(req).decode('utf-8'))
             if not data.get('Success'):
                 continue
@@ -181,7 +213,7 @@ def get_balance_line(user):
                 line += " ⚠️"
             return line
         except Exception as e:
-            logger.warning(f"查询账户余额失败({endpoint}): {e}")
+            logger.warning(f"查询账户余额失败({endpoint}): {safe_error_text(e)}")
     return ""
 
 # ---------- 查询实例状态 ----------
@@ -189,6 +221,8 @@ def get_balance_line(user):
 def get_instance_status(client, instance_id):
     req_ecs = DescribeInstancesRequest()
     req_ecs.set_protocol_type('https')
+    req_ecs.set_connect_timeout(5)
+    req_ecs.set_read_timeout(15)
     req_ecs.set_InstanceIds(json.dumps([instance_id]))
     resp_ecs = client.do_action_with_exception(req_ecs)
     data_ecs = json.loads(resp_ecs.decode('utf-8'))
@@ -196,6 +230,67 @@ def get_instance_status(client, instance_id):
     if not instances:
         return None
     return instances[0].get("Status")
+
+
+_TRANSIENT_NETWORK_EXCEPTION_NAMES = frozenset({
+    'connecttimeout', 'connecttimeouterror', 'readtimeout', 'readtimeouterror',
+    'timeout', 'remotedisconnected', 'ssleoferror', 'sslerror', 'protocolerror',
+    'maxretryerror', 'newconnectionerror', 'connectionerror',
+    'connectionreseterror', 'brokenpipeerror', 'incompleteread',
+    'chunkedencodingerror',
+})
+_TRANSIENT_NETWORK_ERROR_MARKERS = (
+    'connecttimeout', 'readtimeout', 'read timed out',
+    'remote disconnected', 'remotedisconnected',
+    'ssleoferror', 'sslerror', 'max retries exceeded', 'maxretryerror',
+    'connection aborted', 'connection reset', 'connection refused',
+    'broken pipe', 'incomplete read', 'newconnectionerror',
+    'eof occurred in violation',
+)
+
+
+def is_transient_network_error(error):
+    """识别 SDK 包装过的网络错误，避免把 API 业务错误纳入重试。"""
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+
+        error_type = type(current)
+        class_name = error_type.__name__.lower()
+        if class_name in _TRANSIENT_NETWORK_EXCEPTION_NAMES:
+            return True
+
+        error_text = str(current).lower()
+        if any(marker in error_text for marker in _TRANSIENT_NETWORK_ERROR_MARKERS):
+            return True
+
+        for attribute in ('__cause__', '__context__', 'reason', 'original_error'):
+            cause = getattr(current, attribute, None)
+            if isinstance(cause, BaseException):
+                pending.append(cause)
+    return False
+
+
+def request_cdt_traffic_with_retry(client, request):
+    """在一次巡检内重试 CDT 瞬态网络失败，最终错误交给外层统一处理。"""
+    for attempt in range(1, CDT_RETRY_ATTEMPTS + 1):
+        try:
+            return client.do_action_with_exception(request)
+        except Exception as error:
+            if not is_transient_network_error(error) or attempt >= CDT_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                f"CDT流量请求暂时失败（第 {attempt}/{CDT_RETRY_ATTEMPTS} 次）: "
+                f"{safe_error_text(error)}，{CDT_RETRY_DELAY}s 后重试"
+            )
+            time.sleep(CDT_RETRY_DELAY)
 
 # ---------- 核心逻辑 ----------
 
@@ -215,11 +310,11 @@ def check_and_act(user, tg_conf, state):
         req_traffic.set_action_name('ListCdtInternetTraffic')
         req_traffic.set_method('POST')
         req_traffic.set_protocol_type('https')
-        req_traffic.set_connect_timeout(5000)   # 连接 5 秒内必须成功，避免黑洞 IP 卡死
-        req_traffic.set_read_timeout(15000)      # 读取 15 秒
+        req_traffic.set_connect_timeout(5)   # 连接 5 秒内必须成功，避免黑洞 IP 卡死
+        req_traffic.set_read_timeout(15)     # 读取 15 秒
         # CDT 流量查询强制使用 cn-hangzhou client 避免某些地域导致卡死
         cdt_client = AcsClient(user['ak'], user['sk'], 'cn-hangzhou')
-        resp_traffic = cdt_client.do_action_with_exception(req_traffic)
+        resp_traffic = request_cdt_traffic_with_retry(cdt_client, req_traffic)
         data_traffic = json.loads(resp_traffic.decode('utf-8'))
         total_bytes = sum(d.get('Traffic', 0) for d in data_traffic.get('TrafficDetails', []))
         curr_gb = total_bytes / (1024 ** 3)
@@ -263,11 +358,13 @@ def check_and_act(user, tg_conf, state):
                 try:
                     start_req = StartInstanceRequest()
                     start_req.set_protocol_type('https')
+                    start_req.set_connect_timeout(5)
+                    start_req.set_read_timeout(15)
                     start_req.set_InstanceId(instance_id)
                     client.do_action_with_exception(start_req)
                     logger.info(f"[{name}] StartInstance API 调用成功，等待实例进入 Running...")
                 except Exception as api_err:
-                    err_msg = str(api_err)
+                    err_msg = safe_error_text(api_err)
                     new_failures = failures + 1
                     set_start_failures(state, instance_id, new_failures)
                     logger.warning(f"[{name}] StartInstance API 调用失败: {err_msg}，"
@@ -340,6 +437,8 @@ def check_and_act(user, tg_conf, state):
                 logger.info(f"[{name}] 流量超标({curr_gb:.2f}GB >= {limit}GB)，正在停止...")
                 stop_req = StopInstanceRequest()
                 stop_req.set_protocol_type('https')
+                stop_req.set_connect_timeout(5)
+                stop_req.set_read_timeout(15)
                 stop_req.set_InstanceId(instance_id)
                 client.do_action_with_exception(stop_req)
                 if can_notify(state, instance_id, 'overlimit', OVERLIMIT_COOLDOWN):
@@ -357,13 +456,14 @@ def check_and_act(user, tg_conf, state):
                         mark_notified(state, instance_id, 'overlimit')
 
     except Exception as e:
-        logger.error(f"[{name}] 检查出错: {e}")
+        err_msg = safe_error_text(e)
+        logger.error(f"[{name}] 检查出错: {err_msg}")
         # 连续多次巡检失败说明监控对该实例已"失明"（期间无法自动止损），及时提醒人工介入
         info = state.setdefault(instance_id, {})
         info['check_failures'] = info.get('check_failures', 0) + 1
         if info['check_failures'] >= CHECK_FAILURE_ALERT_THRESHOLD and can_notify(state, instance_id, 'check_failed'):
             msg = (f"机器: {sanitize_markdown(name)}\n"
-                   f"⚠️ 已连续 {info['check_failures']} 次巡检失败，最近错误: {sanitize_markdown(e)}\n"
+                   f"⚠️ 已连续 {info['check_failures']} 次巡检失败，最近错误: {sanitize_markdown(err_msg)}\n"
                    f"期间流量监控与自动止损不可用，请人工确认实例状态。")
             if send_tg_alert(tg_conf, "监控异常告警", msg, "red"):
                 mark_notified(state, instance_id, 'check_failed')
@@ -405,7 +505,7 @@ def acquire_run_lock():
     try:
         lock_fp = open(LOCK_FILE, 'w')
     except OSError as e:
-        logger.warning(f"无法创建锁文件: {e}，本轮不加锁继续执行")
+        logger.warning(f"无法创建锁文件: {safe_error_text(e)}，本轮不加锁继续执行")
         return True
     try:
         fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
