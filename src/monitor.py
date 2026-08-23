@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import json
 import sys
 import logging
@@ -218,12 +218,15 @@ def get_balance_line(user):
 
 # ---------- 查询实例状态 ----------
 
-def get_instance_status(client, instance_id):
+def get_instance_status(client, instance_id, resgroup=''):
     req_ecs = DescribeInstancesRequest()
     req_ecs.set_protocol_type('https')
     req_ecs.set_connect_timeout(5)
     req_ecs.set_read_timeout(15)
     req_ecs.set_InstanceIds(json.dumps([instance_id]))
+    # RAM 授权收敛到资源组级别时需显式携带 ResourceGroupId（与 report.py 行为保持一致）
+    if resgroup:
+        req_ecs.set_ResourceGroupId(resgroup)
     resp_ecs = client.do_action_with_exception(req_ecs)
     data_ecs = json.loads(resp_ecs.decode('utf-8'))
     instances = data_ecs.get("Instances", {}).get("Instance", [])
@@ -297,6 +300,7 @@ def request_cdt_traffic_with_retry(client, request):
 def check_and_act(user, tg_conf, state):
     instance_id = user['instance_id']
     name        = user.get('name', instance_id)
+    resgroup    = (user.get('resgroup') or '').strip()
     if user.get('paused') or user.get('disabled'):
         logger.info(f"[{name}] 监控已暂停，跳过本轮检查")
         return
@@ -320,7 +324,7 @@ def check_and_act(user, tg_conf, state):
         curr_gb = total_bytes / (1024 ** 3)
 
         # 2. 获取实例当前状态
-        status = get_instance_status(client, instance_id)
+        status = get_instance_status(client, instance_id, resgroup)
         if status is None:
             logger.error(f"[{name}] 未找到实例: {instance_id}")
             return
@@ -386,7 +390,7 @@ def check_and_act(user, tg_conf, state):
                     time.sleep(START_POLL_INTERVAL)
                     waited += START_POLL_INTERVAL
                     try:
-                        real_status = get_instance_status(client, instance_id)
+                        real_status = get_instance_status(client, instance_id, resgroup)
                     except Exception:
                         real_status = "Unknown"
                     logger.info(f"[{name}] 等待启动... 当前状态: {real_status} ({waited}s)")

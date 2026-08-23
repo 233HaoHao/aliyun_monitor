@@ -7,6 +7,7 @@ import datetime
 import requests
 import logging
 from logging.handlers import TimedRotatingFileHandler
+from urllib.parse import quote
 
 # 修正 urllib3 在 Python 3.12 下引发的 SNI 丢失问题
 try:
@@ -110,12 +111,19 @@ def send_tg_report(tg_conf, message):
             logger.info("Telegram 日报发送成功 (%s/%s)", index, len(chunks))
 
 def send_bark_report(bark_conf, message):
-    if not bark_conf.get('bark_url'):
+    """Bark 通过 GET 路径传参：内容必须 URL 编码（日报含换行/空格，不编码会导致请求直接失败），
+    且日报过长时截断以避免超出 URL 长度限制"""
+    base_url = (bark_conf.get('bark_url') or '').strip().rstrip('/')
+    if not base_url:
         return
     try:
-        url = f"{bark_conf['bark_url']}/Aliyun监控/{message}"
-        requests.get(url, timeout=10)
-        logger.info("Bark 日报发送成功")
+        body = quote(message[:1200], safe='')
+        url = f"{base_url}/Aliyun监控/{body}"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            logger.info("Bark 日报发送成功")
+        else:
+            logger.error("Bark 日报发送失败: HTTP %s", response.status_code)
     except Exception as e:
         logger.error("Bark 日报发送失败: %s", e)
 
