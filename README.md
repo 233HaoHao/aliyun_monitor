@@ -88,12 +88,10 @@
 
 使用 **root 用户** 登录 Alpine 后，下载并执行脚本：
 ```bash
-# wget
-bash <(wget -qO- https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/install2.sh)
-
-# curl
-bash <(curl -sL https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/install2.sh)
+wget -qO- https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/install2.sh | sh
 ```
+
+> 说明：`install2.sh` 按 POSIX sh 编写并从 `/dev/tty` 读取交互输入，可直接管道给 `sh` 执行；Alpine 默认 ash 不支持 `bash <(...)` 进程替换，请勿改用该写法。
 
 ---
 

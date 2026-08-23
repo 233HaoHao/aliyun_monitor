@@ -1,5 +1,36 @@
 #!/bin/bash
 
+# 兼容性自救援（issue #7）：本脚本依赖 bash 特性（EUID / function / read -p）且需要交互终端。
+# 若被 sh/dash 执行或经管道灌入（如 wget ... | sh），自动转存后用 bash 从真实终端重新执行，
+# 避免 dash 语法报错、以及脚本内容与交互输入抢占 stdin。
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/10000ge10000/aliyun_monitor/main/install.sh"
+
+if [ -p /dev/stdin ]; then
+    # 管道灌入：解释器可能已预读缓冲部分内容，重新下载完整脚本最可靠
+    _RESCUE_TMP="$(mktemp "${TMPDIR:-/tmp}/aliyun_monitor_install.XXXXXX")"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$INSTALL_SCRIPT_URL" -o "$_RESCUE_TMP" || { echo "[错误] 下载脚本失败，请检查网络" >&2; rm -f "$_RESCUE_TMP"; exit 1; }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$_RESCUE_TMP" "$INSTALL_SCRIPT_URL" || { echo "[错误] 下载脚本失败，请检查网络" >&2; rm -f "$_RESCUE_TMP"; exit 1; }
+    else
+        echo "[错误] 未找到 curl/wget，请改用: bash <(wget -qO- $INSTALL_SCRIPT_URL)" >&2
+        exit 1
+    fi
+    echo "检测到管道执行，已自动切换为 bash 交互模式..."
+    bash "$_RESCUE_TMP" </dev/tty
+    _RC=$?
+    rm -f "$_RESCUE_TMP"
+    exit $_RC
+elif [ -z "${BASH_VERSION:-}" ] && [ -r "$0" ]; then
+    # 被 sh/dash 以文件方式执行：复制自身后用 bash 重跑
+    _RESCUE_TMP="$(mktemp "${TMPDIR:-/tmp}/aliyun_monitor_install.XXXXXX")"
+    cp -- "$0" "$_RESCUE_TMP"
+    bash "$_RESCUE_TMP" </dev/tty
+    _RC=$?
+    rm -f "$_RESCUE_TMP"
+    exit $_RC
+fi
+
 # 定义颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
